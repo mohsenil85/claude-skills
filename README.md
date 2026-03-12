@@ -14,14 +14,14 @@ Reusable [Claude Code](https://docs.anthropic.com/en/docs/claude-code) skills fo
 
 ## Install
 
-Clone the repo and symlink each skill into your Claude Code skills directory:
+Clone the repo and symlink each skill into your Claude Code commands directory:
 
 ```bash
-git clone https://github.com/nnnnicholas/claude-skills.git ~/Projects/claude-skills
+git clone https://github.com/mohsenil85/claude-skills.git ~/Projects/claude-skills
 
-mkdir -p ~/.claude/skills
+mkdir -p ~/.claude/commands
 for skill in commit pr review tidy undo; do
-  ln -sf ~/Projects/claude-skills/$skill ~/.claude/skills/$skill
+  ln -sf ~/Projects/claude-skills/$skill/SKILL.md ~/.claude/commands/$skill.md
 done
 ```
 
