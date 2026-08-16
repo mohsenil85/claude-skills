@@ -1,7 +1,1 @@
 .DS_Store
-
-# Local-only skills. These describe homelab hostnames, usernames, and the
-# password-store layout, so they stay out of this public repo. They still work
-# locally via the symlink into ~/.claude/skills/.
-pass/
-yohoho/
