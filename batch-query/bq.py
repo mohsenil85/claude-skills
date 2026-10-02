@@ -5,16 +5,28 @@ SQLite DB (system of record): ~/.pi/agent/state/batch-query.db
 
 Subcommands:
   estimate <model> <prompt-file> [max_tokens]   -- preflight cost report, no submit
-  submit  <model> <prompt-file> [--max-tokens N] [--digest "one liner"]
+  submit  <model> <prompt-file> [--max-tokens N] [--digest "one liner"] [REASONING] [--dry-run]
                                                -- preflight + submit 1-item batch
-  submit-many <model> <prompts-dir>             -- one batch, N requests (one file each)
+  submit-many <model> <prompts-dir> [--max-tokens N] [REASONING] [--dry-run]
+                                               -- one batch, N requests (one file each)
+  continue <id> [--max-tokens N] [--note TEXT] [--note-file PATH] [--digest "..."]
+           [REASONING] [--force] [--dry-run]   -- resubmit a truncated answer: original
+                                                  prompt + cut-off text + "continue";
+                                                  default --max-tokens is 2x the original
   queue                                        -- list ledger rows
   status  <id>                                 -- poll single row once, update db
   collect <id>                                 -- fetch results to disk, update db
   poll-loop [--interval 600]                   -- zmx poller: loop until all rows terminal
   spend                                        -- lifetime + recent cost report
+
+REASONING (OpenRouter's `reasoning` parameter; use one of the two):
+  --reasoning-effort max|xhigh|high|medium|low|minimal|none
+  --reasoning-max-tokens N                     -- must be below --max-tokens
+Reasoning tokens count against --max-tokens and are billed as output.
+
+--dry-run prints the cost estimate and the request (prompt text elided) without submitting.
 """
-import json, os, sqlite3, sys, time, urllib.request, urllib.error
+import json, os, sqlite3, sys, tempfile, time, urllib.request, urllib.error
 
 DB_PATH = os.path.expanduser("~/.pi/agent/state/batch-query.db")
 RESULTS_DIR = os.path.expanduser("~/.pi/agent/state/batch-query-results")
@@ -27,6 +39,7 @@ PRICES = {
     "anthropic/claude-fable-5.1:batch": (5.0, 25.0),
 }
 TERMINAL = {"completed", "failed", "expired", "cancelled"}
+REASONING_EFFORTS = ("max", "xhigh", "high", "medium", "low", "minimal", "none")
 
 
 def db():
@@ -54,6 +67,10 @@ def db():
         );
         """
     )
+    # request options (reasoning, continuation parent), added after the original schema
+    if "opts_json" not in {r[1] for r in con.execute("PRAGMA table_info(queries)")}:
+        con.execute("ALTER TABLE queries ADD COLUMN opts_json TEXT")
+        con.commit()
     return con
 
 
@@ -73,6 +90,50 @@ def http(method, url, body=None):
             return json.loads(r.read() or b"{}")
     except urllib.error.HTTPError as e:
         sys.exit(f"HTTP {e.code} from {url}: {e.read().decode()[:500]}")
+
+
+def parse_flags(args, value_flags, bool_flags=()):
+    """Split args into positionals and --flag options; unknown flags are an error."""
+    pos, opts, i = [], {}, 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("--"):
+            name = a[2:]
+            if name in bool_flags:
+                opts[name] = True
+                i += 1
+            elif name in value_flags:
+                if i + 1 >= len(args):
+                    sys.exit(f"{a} needs a value")
+                opts[name] = args[i + 1]
+                i += 2
+            else:
+                known = ", ".join("--" + f for f in (*value_flags, *bool_flags))
+                sys.exit(f"unknown flag {a} (known: {known})")
+        else:
+            pos.append(a)
+            i += 1
+    return pos, opts
+
+
+REASONING_FLAGS = ("reasoning-effort", "reasoning-max-tokens")
+
+
+def reasoning_from(opts, max_tokens):
+    """OpenRouter `reasoning` object from --reasoning-* flags, or None."""
+    effort, rmax = opts.get("reasoning-effort"), opts.get("reasoning-max-tokens")
+    if effort and rmax:
+        sys.exit("use --reasoning-effort or --reasoning-max-tokens, not both")
+    if effort:
+        if effort not in REASONING_EFFORTS:
+            sys.exit(f"--reasoning-effort must be one of: {', '.join(REASONING_EFFORTS)}")
+        return {"effort": effort}
+    if rmax:
+        rmax = int(rmax)
+        if rmax >= max_tokens:
+            sys.exit("--reasoning-max-tokens must be below --max-tokens, or no room is left for the answer")
+        return {"max_tokens": rmax}
+    return None
 
 
 def count_tokens(text):
@@ -119,14 +180,14 @@ def freeze_prompt(model, prompt, label="prompt"):
     return path
 
 
-def build_request(prompt, max_tokens, idx=0):
-    return {
-        "custom_id": f"req-{idx:04d}",
-        "body": {
-            "max_tokens": max_tokens,
-            "messages": [{"role": "user", "content": prompt}],
-        },
+def build_request(prompt, max_tokens, idx=0, reasoning=None):
+    body = {
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt}],
     }
+    if reasoning:
+        body["reasoning"] = reasoning
+    return {"custom_id": f"req-{idx:04d}", "body": body}
 
 
 def cmd_estimate(args):
@@ -136,7 +197,7 @@ def cmd_estimate(args):
     preflight_report(model, prompt, max_tokens)
 
 
-def submit(model, prompts, digests, max_tokens):
+def submit(model, prompts, digests, max_tokens, reasoning=None, extra_opts=None, dry_run=False):
     if model not in PRICES:
         sys.exit(f"Unknown batch model {model!r}. Known: {', '.join(PRICES)}")
     # combined preflight
@@ -150,9 +211,20 @@ def submit(model, prompts, digests, max_tokens):
     body = {
         "endpoint": "/v1/chat/completions",
         "model": model,
-        "requests": [build_request(p, max_tokens, i) for i, p in enumerate(prompts)],
+        "requests": [build_request(p, max_tokens, i, reasoning) for i, p in enumerate(prompts)],
     }
     # NOTE: keys serialized in insertion order: endpoint, model, requests (stream-parse requirement)
+    if dry_run:
+        shown = json.loads(json.dumps(body))
+        for r in shown["requests"]:
+            for m in r["body"]["messages"]:
+                m["content"] = f"<{len(m['content'])} chars>"
+        print("dry run — nothing submitted. Request body:")
+        print(json.dumps(shown, indent=1))
+        return None
+    opts = dict(extra_opts or {})
+    if reasoning:
+        opts["reasoning"] = reasoning
     resp = http("POST", API, body)
     now = time.time()
     con = db()
@@ -161,7 +233,7 @@ def submit(model, prompts, digests, max_tokens):
         pp = freeze_prompt(model, p, digests[i] if i < len(digests) else "")
         paths.append(pp)
         con.execute(
-            "INSERT INTO queries (batch_ref, model, question_digest, prompt_path, est_cost_usd, max_tokens, n_requests, submitted_at, deadline_at, status) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO queries (batch_ref, model, question_digest, prompt_path, est_cost_usd, max_tokens, n_requests, submitted_at, deadline_at, status, opts_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (
                 resp.get("id"),
                 model,
@@ -173,6 +245,7 @@ def submit(model, prompts, digests, max_tokens):
                 time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)),
                 time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now + WINDOW_SECONDS)),
                 resp.get("status", "validating"),
+                json.dumps(opts) if opts else None,
             ),
         )
     con.commit()
@@ -183,31 +256,96 @@ def submit(model, prompts, digests, max_tokens):
 
 
 def cmd_submit(args):
-    model, prompt_file = args[0], args[1]
-    max_tokens, digest = 16000, ""
-    rest = args[2:]
-    i = 0
-    while i < len(rest):
-        if rest[i] == "--max-tokens":
-            max_tokens = int(rest[i + 1]); i += 2
-        elif rest[i] == "--digest":
-            digest = rest[i + 1]; i += 2
-        else:
-            i += 1
+    pos, opts = parse_flags(args, ("max-tokens", "digest", *REASONING_FLAGS), ("dry-run",))
+    if len(pos) != 2:
+        sys.exit("usage: submit <model> <prompt-file> [--max-tokens N] [--digest TEXT] [--reasoning-...] [--dry-run]")
+    model, prompt_file = pos
+    max_tokens = int(opts.get("max-tokens", 16000))
+    reasoning = reasoning_from(opts, max_tokens)
     prompt = open(prompt_file).read()
-    if not digest:
-        digest = prompt.strip().splitlines()[0][:70] if prompt.strip() else "untitled"
-    submit(model, [prompt], [digest], max_tokens)
+    digest = opts.get("digest") or (prompt.strip().splitlines()[0][:70] if prompt.strip() else "untitled")
+    submit(model, [prompt], [digest], max_tokens, reasoning, dry_run=opts.get("dry-run", False))
 
 
 def cmd_submit_many(args):
-    model, prompts_dir = args[0], args[1]
+    pos, opts = parse_flags(args, ("max-tokens", *REASONING_FLAGS), ("dry-run",))
+    if len(pos) != 2:
+        sys.exit("usage: submit-many <model> <prompts-dir> [--max-tokens N] [--reasoning-...] [--dry-run]")
+    model, prompts_dir = pos
+    max_tokens = int(opts.get("max-tokens", 16000))
+    reasoning = reasoning_from(opts, max_tokens)
     files = sorted(f for f in os.listdir(prompts_dir) if f.endswith((".md", ".txt")))
     if not files:
         sys.exit("no .md/.txt files found")
     prompts = [open(os.path.join(prompts_dir, f)).read() for f in files]
     digests = [f for f in files]
-    submit(model, prompts, digests, 16000)
+    submit(model, prompts, digests, max_tokens, reasoning, dry_run=opts.get("dry-run", False))
+
+
+CONTINUATION = """{original}
+
+# Your earlier response
+
+Your earlier response to this request stopped because it reached the output limit. Here it is, verbatim:
+
+----- BEGIN YOUR EARLIER RESPONSE -----
+
+{partial}
+
+----- END YOUR EARLIER RESPONSE -----
+
+# Continue your response
+
+Pick up exactly where that response stopped, as if there had been no break.
+
+- Don't repeat or summarize anything above. Start directly with the next word, sentence, bullet or heading.
+- Finish everything the original request asked for, keeping the same structure, numbering and format.
+- Your output space is limited again, so keep private reasoning brief and spend the budget on the answer.
+"""
+
+
+def cmd_continue(args):
+    pos, opts = parse_flags(
+        args, ("max-tokens", "note", "note-file", "digest", *REASONING_FLAGS), ("force", "dry-run")
+    )
+    if len(pos) != 1:
+        sys.exit("usage: continue <id> [--max-tokens N] [--note TEXT] [--note-file PATH] [--reasoning-...] [--force] [--dry-run]")
+    con = db()
+    row = con.execute("SELECT * FROM queries WHERE id=?", (int(pos[0]),)).fetchone()
+    if not row:
+        sys.exit("no such row")
+    if row["status"] != "completed" or not row["result_path"]:
+        sys.exit(f"row {row['id']} is {row['status']}; only completed, collected rows can be continued")
+    if (row["n_requests"] or 1) != 1:
+        sys.exit("continue supports single-request rows only")
+    result_json = row["result_path"][:-3] + ".json" if row["result_path"].endswith(".md") else row["result_path"]
+    results = json.load(open(result_json)).get("results") or []
+    if len(results) != 1 or not results[0].get("response"):
+        sys.exit("expected exactly one result with a response")
+    choice = results[0]["response"].get("body", {}).get("choices", [{}])[0]
+    partial = (choice.get("message", {}).get("content") or "").rstrip()
+    if not partial:
+        sys.exit("the earlier response has no text to continue from (reasoning likely used the whole cap); "
+                 "resubmit with a higher --max-tokens or a --reasoning-* cap instead")
+    if choice.get("finish_reason") != "length" and not opts.get("force"):
+        sys.exit(f"row {row['id']} wasn't truncated (finish_reason={choice.get('finish_reason')!r}); "
+                 "pass --force to continue anyway")
+    note = opts.get("note", "")
+    if opts.get("note-file"):
+        note = "\n\n".join(x for x in (note, open(opts["note-file"]).read().strip()) if x)
+    prompt = CONTINUATION.format(original=open(row["prompt_path"]).read().rstrip(), partial=partial)
+    if note:
+        prompt += f"\n# Notes for this continuation\n\n{note}\n"
+    max_tokens = int(opts.get("max-tokens") or 2 * (row["max_tokens"] or 16000))
+    reasoning = reasoning_from(opts, max_tokens)
+    digest = opts.get("digest") or f"{row['question_digest']} (cont. of #{row['id']})"
+    if opts.get("dry-run"):
+        fd, path = tempfile.mkstemp(prefix=f"bq-continue-{row['id']}-", suffix=".md")
+        with os.fdopen(fd, "w") as f:
+            f.write(prompt)
+        print(f"continuation prompt written to {path}")
+    submit(row["model"], [prompt], [digest], max_tokens, reasoning,
+           {"continues": row["id"]}, dry_run=opts.get("dry-run", False))
 
 
 def refresh(con, row):
@@ -345,6 +483,7 @@ def main():
         "estimate": cmd_estimate,
         "submit": cmd_submit,
         "submit-many": cmd_submit_many,
+        "continue": cmd_continue,
         "queue": cmd_queue,
         "status": cmd_status,
         "collect": cmd_collect,
