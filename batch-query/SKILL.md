@@ -112,8 +112,8 @@ python3 ~/.claude/skills/batch-query/bq.py continue <id> --reasoning-effort medi
 
 ## Notes
 
-- Statuses run `validating → in_progress → finalizing → completed`; the final states are completed, failed, expired and
-  cancelled.
+- Statuses run `validating → in_progress → finalizing → completed`; the final states are completed, failed,
+  expired and cancelled.
 - OpenRouter deletes batch artifacts after 30 days. Results are saved locally on completion, so nothing is lost.
 - In pi, pair this with the `panel-query` skill: a quick answer now from the panel, and the thorough one from a batch
   model later.
