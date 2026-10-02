@@ -6,6 +6,7 @@ Reusable [Claude Code](https://docs.anthropic.com/en/docs/claude-code) skills fo
 
 | Skill | Description |
 |-------|-------------|
+| `/batch-query` | Half-price OpenRouter batch queries (Astra, Fable) with a cost ledger and continuations |
 | `/cmux` | Orchestrate cmux terminal sessions — parallel commands, output monitoring |
 | `/commit` | Intelligently group dirty changes into clean, logical commits |
 | `/health` | Run a health check across hosts and services |
@@ -25,7 +26,7 @@ Clone the repo and symlink each skill directory into your Claude Code skills dir
 git clone https://github.com/mohsenil85/claude-skills.git ~/Projects/claude-skills
 
 mkdir -p ~/.claude/skills
-for skill in cmux commit health pi-worker plain pr read-mail review tidy undo; do
+for skill in batch-query cmux commit health pi-worker plain pr read-mail review tidy undo; do
   ln -sf ~/Projects/claude-skills/$skill ~/.claude/skills/$skill
 done
 ```
@@ -38,11 +39,16 @@ skill to bundle helper scripts or reference files.
 Skills that reference homelab hosts, credentials, or service layout live in a
 separate private repo rather than here.
 
+`batch-query` also works from [pi](https://github.com/earendil-works/pi): link
+`~/.pi/agent/skills/batch-query` to the same directory. Both agents share its
+ledger in `~/.pi/agent/state/`.
+
 ## Usage
 
 In any Claude Code session, type `/<skill-name>` to invoke a skill:
 
 ```
+/batch-query     # submit, track, and continue batch queries
 /cmux            # orchestrate cmux terminal sessions
 /commit          # group and commit dirty changes
 /health          # health check across hosts and services
