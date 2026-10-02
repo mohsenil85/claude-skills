@@ -1,85 +1,121 @@
 ---
 name: batch-query
 description: >
-  Prep and submit questions to OpenRouter batch-tier models (astra:batch,
-  fable:batch) at 50% cost with a 24h completion window, tracked in a SQLite
-  system of record with cost reporting. Use when asked to run a batch query,
-  submit to batch, use astra/fabel batch, /batch, or to check batch queue,
-  status, collect, or spend.
+  Prep and submit self-contained prompts to OpenRouter batch-tier models (astra:batch, fable:batch) at 50% cost with a
+  24h completion window, tracked in a shared SQLite ledger with cost reporting, and continue answers that were cut
+  off. Use when asked to run a batch query, submit to batch, use astra/fable/fabel batch, /batch-query, or to check
+  the batch queue, status, results, a continuation, or spend.
+argument-hint: "[estimate|submit|continue|queue|status|collect|spend] ..."
 ---
 
 # Batch Query
 
-Submit questions to half-price batch models (`openai/gpt-6-astra:batch`,
-`anthropic/claude-fable-5.1:batch`, both $5/M in $25/M out, 1M ctx) via the
-OpenRouter Batch API. Answers arrive within 24h (usually much sooner).
-Everything is tracked in SQLite: `~/.pi/agent/state/batch-query.db`.
+Submit prompts to half-price batch models through the OpenRouter Batch API: `openai/gpt-6-astra:batch` and
+`anthropic/claude-fable-5.1:batch` ($5/M input, $25/M output, 1M context). Answers arrive within 24 hours. Astra has
+taken 5 to 20 minutes; Fable anywhere from 10 minutes to about 12 hours.
 
-Tooling: `bq.py` next to this file. It reads `OPENROUTER_API_KEY` from env.
+Claude Code and pi share this skill and its state:
 
-## Procedure
+- **Tool:** `bq.py` next to this file. Run it as `python3 ~/.claude/skills/batch-query/bq.py` (pi sees the same file
+  at `~/.pi/agent/skills/batch-query/bq.py`). It reads `OPENROUTER_API_KEY` from the environment.
+- **State:** the ledger `~/.pi/agent/state/batch-query.db`, frozen prompts in `~/.pi/agent/state/batch-query-prompts/`,
+  results in `~/.pi/agent/state/batch-query-results/` (JSON plus a readable `.md`).
 
-### 1. Pre-flight (always, before any submit)
+## 1. Write the prompt
 
-- **Prompt is self-contained and text-only.** Batch has no follow-up and
-  rejects images/files. Bake all context into the prompt; state assumptions
-  explicitly ("Assume X unless stated"). Extract any session context into the
-  prompt text before freezing it.
-- **Dry-run the cost estimate**:
+- **Self-contained.** There's no follow-up turn: put all context in one Markdown file and state your assumptions.
+- **Instructions first.** For a long bundle (a codebase, a document set), put the task at the top and restate it
+  briefly at the end.
+- **Text only from `bq.py`.** The Batch API accepts images only as public `http(s)` URLs (never base64), and `bq.py`
+  sends plain text, so describe visuals in words.
+
+## 2. Estimate and get approval
+
+```bash
+python3 ~/.claude/skills/batch-query/bq.py estimate anthropic/claude-fable-5.1:batch /path/prompt.md 64000
+```
+
+- The estimate assumes 4 characters per token, which runs low. On a code-heavy bundle (HTML, CSS, Markdown), Claude's
+  tokenizer billed about 1.7 times the estimate (64k estimated, 109k billed); GPT billed about 1.15 times. Scale the
+  input figure before quoting a cost.
+- Show the user the estimate before submitting unless they have approved a budget. State the trade-off: half price,
+  answer within 24 hours.
+
+## 3. Set max_tokens and reasoning
+
+- Reasoning tokens count against `max_tokens` and are billed as output.
+- On Claude models OpenRouter's default reasoning budget is large. A Fable run with `--max-tokens 32000` spent 24.6k
+  tokens reasoning, which matches the `high` effort budget (80% of `max_tokens`), and its answer stopped after about
+  3,000 words.
+- For a long deliverable, raise `--max-tokens` (64000 or more), cap thinking with `--reasoning-effort medium` (50%) or
+  `low` (20%) or `--reasoning-max-tokens N` (below `--max-tokens`), and ask for brief reasoning in the prompt.
+- The `--reasoning-*` flags set OpenRouter's `reasoning` parameter. Batch request bodies take the chat-completions
+  shape, but OpenRouter's batch docs don't mention `reasoning` explicitly: check the usage on the first result that
+  uses it.
+
+## 4. Submit
+
+```bash
+python3 ~/.claude/skills/batch-query/bq.py submit anthropic/claude-fable-5.1:batch /path/prompt.md \
+  --max-tokens 64000 --reasoning-effort medium --digest "one-line summary"
+```
+
+- This writes a ledger row, freezes the prompt and submits a one-request batch.
+- **`--dry-run`** prints the estimate and the request body without submitting.
+- **The same question to several models:** run `submit` once per model with the same file.
+- **Many questions to one model:** put one prompt per `.md`/`.txt` file in a directory and run
+  `submit-many <model> <dir> [--max-tokens N]`; they become one batch.
+- Unknown flags are rejected, so a typo can't silently fall back to the 16000-token default.
+
+## 5. Track it
+
+- **Persistent poller (survives the session):** the zmx session `batch-poller` polls every 10 minutes, saves results
+  as they complete, and exits once every row is finished. Restart it after each new submission:
 
   ```bash
-  python3 ~/.pi/agent/skills/batch-query/bq.py estimate \
-    anthropic/claude-fable-5.1:batch /tmp/prompt.md [max_tokens]
+  zmx list | grep batch-poller     # an "ended=" field means it has exited
+  zmx kill batch-poller            # only if it's listed with ended=
+  zmx run batch-poller -d sh -c "/opt/homebrew/bin/python3 $HOME/.claude/skills/batch-query/bq.py poll-loop --interval 600"
+  zmx history batch-poller | tail -3   # expect "poll-loop started"
   ```
 
-  Shows token estimate, cost range (prompt-only .. worst case at max_tokens),
-  and the sync-equivalent price for comparison. Default max_tokens is 16000.
-- **Present the estimate to the user before submitting** unless they said
-  "just submit it". The tradeoff to state: half price, answer within 24h.
+  Use the absolute `/opt/homebrew/bin/python3`. zmx starts a login shell whose PATH finds an old Intel `python3` in
+  `/usr/local/bin` first, which fails with "Bad CPU type" (exit 126).
+- **Claude Code, to be told when a row finishes** (only while the session is open): run this with Bash
+  `run_in_background`, replacing `<ID>`:
 
-### 2. Submit
+  ```bash
+  until s=$(sqlite3 ~/.pi/agent/state/batch-query.db "select status from queries where id=<ID>;"); [[ "$s" =~ ^(completed|failed|expired|cancelled)$ ]]; do sleep 300; done; echo "row <ID>: $s"
+  ```
+
+- **On demand:** `queue`, `status <id>` (polls once), `collect <id>`, `spend`.
+
+## 6. Collect and report
+
+- Check for truncation first: the result `.md` carries a "TRUNCATED" note, and `completion_tokens` equals the cap.
+- Report the key points, the actual cost against the estimate, and the running total from `spend`. The full text stays
+  in the result files.
+
+## 7. Continue an answer that was cut off
 
 ```bash
-python3 bq.py submit <model> <prompt-file> --max-tokens 16000 --digest "one-line summary"
+python3 ~/.claude/skills/batch-query/bq.py continue <id> --dry-run     # writes the prompt, shows the estimate
+python3 ~/.claude/skills/batch-query/bq.py continue <id> --reasoning-effort medium --note-file /path/extra.md
 ```
 
-Writes the ledger row (prompt frozen under
-`~/.pi/agent/state/batch-query-prompts/`), submits a 1-item batch, prints the
-batch_ref. For many questions at once: put one prompt per `.md`/`.txt` file in
-a directory and use `submit-many <model> <dir>` — all become one batch.
-
-### 3. Start the zmx poller (after submitting, if not already running)
-
-```bash
-# via zmx_run (persistent session, non-blocking):
-sh -c "python3 ~/.pi/agent/skills/batch-query/bq.py poll-loop --interval 600"
-```
-
-Run it in the zmx session `batch-poller`. It polls every 10 min, updates the
-DB in place, fetches results on completion (saved under
-`~/.pi/agent/state/batch-query-results/` as JSON + readable .md), and exits
-when every row is terminal. Idempotent/resumable — if in doubt whether it's
-running, starting it again is safe (check `zmx_list` first to avoid dupes).
-
-### 4. Inspect / report
-
-- `bq.py queue` — table: id, status, model, est vs actual cost, digest
-- `bq.py status <id>` — poll once, full detail (usage, deadline, result path)
-- `bq.py collect <id>` — fetch results for one row now
-- `bq.py spend` — lifetime actual + pending estimated spend
-
-On collect, report to the user: answer headline/key points, **actual vs
-estimated cost**, and running total from `spend`. Full text stays in the
-result files.
+- This sends the same model the original prompt, the cut-off answer, and an instruction to resume exactly where it
+  stopped. The continuation is a new ledger row; the default `--max-tokens` is double the original's.
+- Use `--note` or `--note-file` for specifics, such as what's still missing or facts checked since the first run.
+- It refuses rows that weren't truncated (override with `--force`), rows with several requests, and answers with no
+  text at all (resubmit with a higher cap instead).
+- The two parts are separate results: join them when reporting.
 
 ## Notes
 
-- Statuses: `validating → in_progress → finalizing → completed` (terminal:
-  completed/failed/expired/cancelled).
-- OpenRouter deletes batch artifacts after 30 days — results are saved
-  locally on completion, so this is handled.
-- Good pattern (panel crossover): run the panel-query skill now for a cheap
-  immediate answer, and queue the same question to a batch model for the
-  authoritative version.
-- Unknown batch slugs are rejected by `bq.py` — check the model's OpenRouter
-  page for a `:batch` variant and add it to `PRICES` in `bq.py` if new.
+- Statuses run `validating → in_progress → finalizing → completed`; the final states are completed, failed, expired and
+  cancelled.
+- OpenRouter deletes batch artifacts after 30 days. Results are saved locally on completion, so nothing is lost.
+- In pi, pair this with the `panel-query` skill: a quick answer now from the panel, and the thorough one from a batch
+  model later.
+- Unknown batch slugs are rejected. To add a model, check its OpenRouter page for a `:batch` variant and add it to
+  `PRICES` in `bq.py`.
